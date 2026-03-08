@@ -3,6 +3,7 @@ import { Engine } from "@babylonjs/core/Engines/engine";
 import { Scene } from "@babylonjs/core/scene";
 import { ArcRotateCamera } from "@babylonjs/core/Cameras/arcRotateCamera";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
+import { PointLight } from "@babylonjs/core/Lights/pointLight";
 import { Vector3, Color3, Color4 } from "@babylonjs/core/Maths/math";
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
@@ -10,9 +11,12 @@ import { ActionManager } from "@babylonjs/core/Actions/actionManager";
 import { ExecuteCodeAction } from "@babylonjs/core/Actions/directActions";
 import { Animation } from "@babylonjs/core/Animations/animation";
 import { CubicEase, EasingFunction } from "@babylonjs/core/Animations/easing";
+import { GlowLayer } from "@babylonjs/core/Layers/glowLayer";
+import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { AdvancedDynamicTexture } from "@babylonjs/gui/2D/advancedDynamicTexture";
 import { TextBlock } from "@babylonjs/gui/2D/controls/textBlock";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
+import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import type {
   Organization,
   AgentCertificate,
@@ -85,6 +89,8 @@ export default function BabylonGraph({
   const autoOrbitRef = useRef(true);
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const entryDoneRef = useRef(false);
+  const glowRef = useRef<GlowLayer | null>(null);
+  const selectedMeshRef = useRef<Mesh | null>(null);
 
   // Mount engine/scene/camera/lights once
   useEffect(() => {
@@ -112,7 +118,31 @@ export default function BabylonGraph({
     camera.wheelPrecision = 20;
     camera.panningSensibility = 100;
 
-    new HemisphericLight("light", new Vector3(0, 1, 0.5), scene);
+    new HemisphericLight("hemi", new Vector3(0, 1, 0.5), scene);
+
+    // Point lights for depth
+    const pl1 = new PointLight("pl1", new Vector3(10, 8, 10), scene);
+    pl1.intensity = 0.6;
+    pl1.diffuse = new Color3(0.6, 0.7, 1.0);
+
+    const pl2 = new PointLight("pl2", new Vector3(-10, -5, -8), scene);
+    pl2.intensity = 0.4;
+    pl2.diffuse = new Color3(1.0, 0.6, 0.8);
+
+    // GlowLayer for node emission
+    const glow = new GlowLayer("glow", scene);
+    glow.intensity = 0.6;
+    glowRef.current = glow;
+
+    // Rendering pipeline: bloom + FXAA
+    const pipeline = new DefaultRenderingPipeline("pipeline", true, scene, [
+      camera,
+    ]);
+    pipeline.bloomEnabled = true;
+    pipeline.bloomThreshold = 0.3;
+    pipeline.bloomWeight = 0.4;
+    pipeline.bloomKernel = 64;
+    pipeline.fxaaEnabled = true;
 
     const gui = AdvancedDynamicTexture.CreateFullscreenUI("UI", true, scene);
     guiRef.current = gui;
@@ -155,6 +185,8 @@ export default function BabylonGraph({
       engineRef.current = null;
       sceneRef.current = null;
       guiRef.current = null;
+      glowRef.current = null;
+      selectedMeshRef.current = null;
     };
   }, []);
 
@@ -217,17 +249,37 @@ export default function BabylonGraph({
       mat.specularColor = new Color3(0.2, 0.2, 0.2);
       sphere.material = mat;
 
-      // Click handling — fly camera to node
+      // Add to glow layer
+      if (glowRef.current) {
+        glowRef.current.addIncludedOnlyMesh(sphere);
+      }
+
+      // Click handling — fly camera to node + highlight
       sphere.actionManager = new ActionManager(scene);
       sphere.actionManager.registerAction(
         new ExecuteCodeAction(ActionManager.OnPickTrigger, () => {
+          // Unhighlight previous selection
+          const prev = selectedMeshRef.current;
+          if (prev && prev.material) {
+            const prevMat = prev.material as StandardMaterial;
+            const prevNode = prev.metadata?.graphNode as GraphNode | undefined;
+            const prevColor = hexToColor3(
+              NODE_COLORS[prevNode?.type ?? ""] ?? "#6b7280",
+            );
+            prevMat.emissiveColor = prevColor.scale(0.4);
+          }
+
+          // Highlight new selection
+          selectedMeshRef.current = sphere;
+          mat.emissiveColor = color.scale(1.2);
+
           // Pause auto-orbit during fly-to
           autoOrbitRef.current = false;
           if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
 
-          const camera = scene.activeCamera as ArcRotateCamera;
+          const cam = scene.activeCamera as ArcRotateCamera;
           const targetPos = sphere.position.clone();
-          animateCameraTo(camera, targetPos, 5, scene);
+          animateCameraTo(cam, targetPos, 5, scene);
 
           // Resume orbit after fly-to + idle
           idleTimerRef.current = setTimeout(() => {
@@ -270,25 +322,60 @@ export default function BabylonGraph({
       label.linkWithMesh(sphere);
     }
 
-    // Create link lines
+    // Create link lines with hierarchy-based widths
     for (const link of links) {
       const sPos = posMap.get(link.source as string);
       const tPos = posMap.get(link.target as string);
       if (!sPos || !tPos) continue;
 
-      const line = MeshBuilder.CreateLines(
-        `link_${link.source}_${link.target}`,
-        {
-          points: [
-            new Vector3(sPos.x, sPos.y, sPos.z),
-            new Vector3(tPos.x, tPos.y, tPos.z),
-          ],
-        },
-        scene,
-      );
-      line.color = new Color3(0.3, 0.35, 0.45);
-      line.alpha = 0.5;
-      line.metadata = { [GRAPH_TAG]: true };
+      const from = new Vector3(sPos.x, sPos.y, sPos.z);
+      const to = new Vector3(tPos.x, tPos.y, tPos.z);
+
+      if (link.type === "parent" || link.type === "contains") {
+        // Thick tubes for structural links
+        const dist = Vector3.Distance(from, to);
+        if (dist < 0.01) continue;
+        const dir = to.subtract(from);
+        const mid = from.add(dir.scale(0.5));
+
+        const isParent = link.type === "parent";
+        const tubeRadius = isParent ? 0.06 : 0.035;
+
+        const tube = MeshBuilder.CreateTube(
+          `link_${link.source}_${link.target}`,
+          {
+            path: [from, mid, to],
+            radius: tubeRadius,
+            tessellation: 6,
+            cap: 0,
+          },
+          scene,
+        );
+        const tubeMat = new StandardMaterial(
+          `linkMat_${link.source}_${link.target}`,
+          scene,
+        );
+        const linkColor = isParent
+          ? new Color3(0.45, 0.5, 0.65)
+          : new Color3(0.3, 0.35, 0.45);
+        tubeMat.diffuseColor = linkColor;
+        tubeMat.emissiveColor = linkColor.scale(0.3);
+        tubeMat.alpha = isParent ? 0.7 : 0.5;
+        tube.material = tubeMat;
+        tube.metadata = { [GRAPH_TAG]: true };
+      } else {
+        // Thin lines for assigned / peer-link
+        const line = MeshBuilder.CreateLines(
+          `link_${link.source}_${link.target}`,
+          { points: [from, to] },
+          scene,
+        );
+        line.color = link.type === "assigned"
+          ? new Color3(0.4, 0.4, 0.2)
+          : new Color3(0.3, 0.35, 0.45);
+        line.alpha = 0.4;
+        line.metadata = { [GRAPH_TAG]: true };
+      }
     }
 
     // Auto-fit camera + entry fly-in
